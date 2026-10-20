@@ -40,10 +40,42 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and publish Docker image
+        if: github.event_name == 'push'
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ github.event_name == 'push' }}
+          push: true
           tags: |
             mahammadrafaz/devops-project:latest
             mahammadrafaz/devops-project:sha-${{ github.sha }}
+
+      - name: Start SSH agent
+        if: github.event_name == 'push'
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+      - name: Deploy to AWS EC2
+        if: github.event_name == 'push'
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -eu
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+          ssh "$EC2_USER@$EC2_HOST" 'bash -s' <<'REMOTE'
+          set -e
+          sudo docker pull mahammadrafaz/devops-project:latest
+          sudo docker rm -f devops-flask || true
+          sudo docker run -d \
+            --name devops-flask \
+            -p 5000:5000 \
+            --restart unless-stopped \
+            mahammadrafaz/devops-project:latest
+          curl --fail --retry 5 --retry-delay 2 \
+            http://localhost:5000/health
+          REMOTE
