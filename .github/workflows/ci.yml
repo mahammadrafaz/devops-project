@@ -55,6 +55,7 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
 
+
       - name: Deploy to AWS EC2
         if: github.event_name == 'push'
         env:
@@ -62,11 +63,22 @@ jobs:
           EC2_USER: ${{ secrets.EC2_USER }}
         run: |
           set -eu
+          echo "Checking EC2 host configuration..."
+          test -n "$EC2_HOST" || { echo "ERROR: EC2_HOST is empty"; exit 1; }
+          test -n "$EC2_USER" || { echo "ERROR: EC2_USER is empty"; exit 1; }
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+          echo "Testing SSH port 22..."
+          ssh-keyscan -T 10 -H "$EC2_HOST" >> ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
+          echo "Testing SSH authentication..."
+          ssh -v -o BatchMode=yes -o ConnectTimeout=15 \
+            "$EC2_USER@$EC2_HOST" 'echo SSH_AUTH_OK'
+
+          echo "Deploying application..."
           ssh "$EC2_USER@$EC2_HOST" 'bash -s' <<'REMOTE'
           set -e
           sudo docker pull mahammadrafaz/devops-project:latest
@@ -79,3 +91,4 @@ jobs:
           curl --fail --retry 5 --retry-delay 2 \
             http://localhost:5000/health
           REMOTE
+
