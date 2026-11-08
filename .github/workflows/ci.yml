@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   test-and-publish:
@@ -49,46 +50,101 @@ jobs:
             mahammadrafaz/devops-project:latest
             mahammadrafaz/devops-project:sha-${{ github.sha }}
 
-      - name: Start SSH agent
+      - name: Configure AWS credentials
         if: github.event_name == 'push'
-        uses: webfactory/ssh-agent@v0.9.0
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: eu-north-1
 
-
-      - name: Deploy to AWS EC2
+      - name: Deploy through AWS Systems Manager
         if: github.event_name == 'push'
         env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          IMAGE_TAG: sha-${{ github.sha }}
         run: |
-          set -eu
-          echo "Checking EC2 host configuration..."
-          test -n "$EC2_HOST" || { echo "ERROR: EC2_HOST is empty"; exit 1; }
-          test -n "$EC2_USER" || { echo "ERROR: EC2_USER is empty"; exit 1; }
+          set -euo pipefail
 
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
+          test -n "$EC2_INSTANCE_ID"
+          test -n "$IMAGE_TAG"
 
-          echo "Testing SSH port 22..."
-          ssh-keyscan -T 10 -H "$EC2_HOST" >> ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
-
-          echo "Testing SSH authentication..."
-          ssh -v -o BatchMode=yes -o ConnectTimeout=15 \
-            "$EC2_USER@$EC2_HOST" 'echo SSH_AUTH_OK'
-
-          echo "Deploying application..."
-          ssh "$EC2_USER@$EC2_HOST" 'bash -s' <<'REMOTE'
+          DEPLOY_SCRIPT=$(cat <<'SCRIPT'
           set -e
-          sudo docker pull mahammadrafaz/devops-project:latest
+
+          IMAGE="mahammadrafaz/devops-project:__IMAGE_TAG__"
+
+          echo "Pulling image: $IMAGE"
+          sudo docker pull "$IMAGE"
+
+          echo "Replacing existing container..."
           sudo docker rm -f devops-flask || true
+
+          echo "Starting updated container..."
           sudo docker run -d \
             --name devops-flask \
             -p 5000:5000 \
             --restart unless-stopped \
-            mahammadrafaz/devops-project:latest
-          curl --fail --retry 5 --retry-delay 2 \
-            http://localhost:5000/health
-          REMOTE
+            "$IMAGE"
 
+          echo "Checking application health..."
+          for i in $(seq 1 15); do
+            if curl -fsS http://localhost:5000/health; then
+              echo "Deployment successful!"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Health check failed!"
+          sudo docker logs devops-flask --tail 50
+          exit 1
+          SCRIPT
+          )
+
+          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__IMAGE_TAG__/$IMAGE_TAG}"
+
+          PARAMETERS=$(jq -n --arg script "$DEPLOY_SCRIPT" \
+            '{commands: [$script]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy devops-project from GitHub Actions" \
+            --parameters "$PARAMETERS" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM command ID: $COMMAND_ID"
+
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "Pending")
+
+            echo "Deployment status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query "StandardOutputContent" \
+                  --output text
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut)
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --output json
+                exit 1
+                ;;
+            esac
+
+            sleep 10
+          done
+
+          echo "Deployment timed out while waiting for SSM."
+          exit 1
