@@ -30,13 +30,9 @@ Nginx acts as a reverse proxy, while HTTPS is configured using a free Let's Encr
 
 
 
-\## 🏗️ Architecture
+## 🏗️ Architecture
 
-
-![DevOps CI/CD Architecture](docs/devops_ci_cd_architecture.png)
-
-
-
+![DevOps CI/CD Architecture](docs/devops_ci_cd_architecture.jpg)
 ```text
 
 Developer
