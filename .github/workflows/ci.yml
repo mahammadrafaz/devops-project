@@ -54,7 +54,7 @@ jobs:
         if: github.event_name == 'push'
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-to-assume: arn:aws:iam::920887851398:role/github-actions-ec2-deploy
           aws-region: eu-north-1
 
       - name: Deploy through AWS Systems Manager
