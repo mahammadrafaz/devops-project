@@ -1,0 +1,39 @@
+{% extends 'auth/base.html' %}
+{% block title %}Overview · StockFlow{% endblock %}
+{% block content %}
+<section class="dashboard analytics-dashboard">
+  <div class="page-heading"><div><div class="eyebrow">{{ current_user.business.name }} · Overview</div><h1>Welcome, {{ current_user.name.split()[0] }}</h1><p class="muted">Here’s what’s happening with your inventory today.</p></div>
+    <div class="actions">{% if current_user.role in ['owner','manager'] %}<a class="primary" href="{{ url_for('inventory.new_product') }}">＋ Add product</a><a class="secondary" href="{{ url_for('inventory.categories') }}">Manage categories</a>{% endif %}</div>
+  </div>
+  <div class="kpi-grid">
+    <article class="kpi-card"><span class="kpi-icon">▦</span><span class="kpi-label">Total products</span><strong>{{ stats.products }}</strong><small>In your catalog</small></article>
+    <article class="kpi-card"><span class="kpi-icon">▤</span><span class="kpi-label">Stock units</span><strong>{{ stats.units }}</strong><small>Across all products</small></article>
+    <article class="kpi-card"><span class="kpi-icon">＄</span><span class="kpi-label">Inventory value</span><strong>{{ '%.2f'|format(stats.value) }}</strong><small>Purchase price × current quantity</small></article>
+    <article class="kpi-card kpi-alert"><span class="kpi-icon">!</span><span class="kpi-label">Low stock</span><strong>{{ stats.low_stock }}</strong><small>At or below threshold</small></article>
+  </div>
+  <div class="chart-grid">
+    <section class="panel chart-panel"><div class="section-heading"><div><h2>Stock movement</h2><p class="muted">Daily quantities moved</p></div><form method="get" class="period-form"><label for="period">Period</label><select id="period" name="period" onchange="this.form.submit()"><option value="7" {% if period == '7' %}selected{% endif %}>Last 7 days</option><option value="30" {% if period == '30' %}selected{% endif %}>Last 30 days</option></select></form></div>
+      <div class="chart-area"><canvas id="movementChart" role="img" aria-label="Stock in and stock out by day"></canvas></div>
+    </section>
+    <section class="panel chart-panel"><div class="section-heading"><div><h2>Inventory by category</h2><p class="muted">Current stock units</p></div></div>
+      {% if category_values and category_values|sum > 0 %}<div class="category-chart-area"><canvas id="categoryChart" role="img" aria-label="Stock units by product category"></canvas></div>{% else %}<div class="chart-empty">Add products and categories to see your inventory breakdown.</div>{% endif %}
+    </section>
+  </div>
+  <div class="content-grid">
+    <section class="panel dashboard-list"><div class="section-heading"><div><h2>Low-stock alerts <span class="count">{{ stats.low_stock }}</span></h2><p class="muted">Products that need replenishment</p></div><a class="text-link" href="{{ url_for('inventory.index') }}">View inventory →</a></div>
+      {% if low_stock %}<div class="table-wrap"><table><thead><tr><th>Product</th><th>SKU</th><th>On hand</th><th>Threshold</th></tr></thead><tbody>{% for product in low_stock %}<tr><td><a class="product-link" href="{{ url_for('inventory.history', product_id=product.id) }}">{{ product.name }}</a></td><td>{{ product.sku }}</td><td><span class="stock-pill stock-low">{{ product.quantity }}</span></td><td>{{ product.low_stock_threshold }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="list-empty">All products are above their low-stock thresholds.</div>{% endif %}
+    </section>
+    <section class="panel quick-actions"><div class="section-heading"><div><h2>Quick actions</h2><p class="muted">Common inventory tasks</p></div></div><div class="quick-links">{% if current_user.role in ['owner','manager'] %}<a href="{{ url_for('inventory.new_product') }}"><span>＋</span><div><strong>Add product</strong><small>Create a catalog item</small></div><b>→</b></a><a href="{{ url_for('inventory.categories') }}"><span>▦</span><div><strong>Manage categories</strong><small>Organize your catalog</small></div><b>→</b></a>{% endif %}<a href="{{ url_for('inventory.index') }}"><span>↗</span><div><strong>Stock in / out</strong><small>Record a stock movement</small></div><b>→</b></a><a href="{{ url_for('inventory.index') }}"><span>☷</span><div><strong>View inventory</strong><small>Browse all products</small></div><b>→</b></a></div></section>
+  </div>
+  <section class="panel dashboard-list recent-panel"><div class="section-heading"><div><h2>Recent activity</h2><p class="muted">Latest stock movements across your business</p></div><a class="text-link" href="{{ url_for('inventory.index') }}">View inventory →</a></div>
+    {% if recent_movements %}<div class="table-wrap"><table><thead><tr><th>Product</th><th>Movement</th><th>Quantity</th><th>By</th><th>Date &amp; time</th></tr></thead><tbody>{% for movement in recent_movements %}<tr><td><a class="product-link" href="{{ url_for('inventory.history', product_id=movement.product_id) }}">{{ movement.product.name }}</a></td><td><span class="movement movement-{{ movement.operation_type }}">Stock {{ 'in' if movement.operation_type == 'in' else 'out' }}</span></td><td>{{ movement.quantity }}</td><td>{{ movement.user.name if movement.user else 'Former user' }}</td><td>{{ movement.created_at.strftime('%b %d, %Y · %H:%M') }} UTC</td></tr>{% endfor %}</tbody></table></div>{% else %}<div class="list-empty">No stock movements yet. New stock activity will appear here.</div>{% endif %}
+  </section>
+</section>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script>
+const labels = {{ activity_labels|tojson }};
+const chartDefaults = {responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',align:'end',labels:{usePointStyle:true,boxWidth:7,boxHeight:7,color:'#65736a',font:{family:'DM Sans',size:11}}}},scales:{x:{grid:{display:false},ticks:{color:'#859188',maxTicksLimit:8}},y:{beginAtZero:true,grid:{color:'#edf1ee'},ticks:{precision:0,color:'#859188'}}}};
+new Chart(document.getElementById('movementChart'),{type:'bar',data:{labels,datasets:[{label:'Stock in',data:{{ stock_in|tojson }},backgroundColor:'#35a879',borderRadius:4},{label:'Stock out',data:{{ stock_out|tojson }},backgroundColor:'#e89b78',borderRadius:4}]},options:{...chartDefaults,scales:{...chartDefaults.scales,x:{...chartDefaults.scales.x,ticks:{...chartDefaults.scales.x.ticks,callback:(value,index)=>{const d=new Date(labels[index]+'T00:00:00');return d.toLocaleDateString(undefined,{month:'short',day:'numeric'});}}}}}});
+{% if category_values and category_values|sum > 0 %}new Chart(document.getElementById('categoryChart'),{type:'doughnut',data:{labels:{{ category_labels|tojson }},datasets:[{data:{{ category_values|tojson }},backgroundColor:['#146b4d','#35a879','#8bc9a8','#d7e9de','#84a991','#bdd8c7','#a3b4aa'],borderWidth:0,hoverOffset:5}]},options:{responsive:true,maintainAspectRatio:false,cutout:'66%',plugins:{legend:{position:'bottom',labels:{usePointStyle:true,boxWidth:7,boxHeight:7,padding:15,color:'#65736a',font:{family:'DM Sans',size:11}}}}}});{% endif %}
+</script>
+{% endblock %}
