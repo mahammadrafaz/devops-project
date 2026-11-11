@@ -9,8 +9,8 @@ WORKDIR /app
 COPY requirements-prod.txt .
 RUN pip install --no-cache-dir --disable-pip-version-check -r requirements-prod.txt
 
-RUN groupadd --system stockflow \
-    && useradd --system --gid stockflow --home-dir /app stockflow \
+RUN groupadd --system --gid 10001 stockflow \
+    && useradd --system --uid 10001 --gid stockflow --home-dir /app stockflow \
     && mkdir -p /app/instance \
     && chown stockflow:stockflow /app /app/instance
 

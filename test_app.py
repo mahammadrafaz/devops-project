@@ -24,6 +24,38 @@ def test_application_factory_uses_database_url(monkeypatch):
     )
 
 
+def test_production_reads_secrets_from_files(tmp_path, monkeypatch):
+    database_file = tmp_path / "database_url"
+    secret_file = tmp_path / "secret_key"
+    database_file.write_text("postgresql://file-user:file-password@localhost/stockflow\n")
+    secret_file.write_text("file-based-production-key\n")
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    monkeypatch.setenv("DATABASE_URL_FILE", str(database_file))
+    monkeypatch.setenv("SECRET_KEY_FILE", str(secret_file))
+
+    app = create_app()
+
+    assert app.config["SECRET_KEY"] == "file-based-production-key"
+    assert app.config["SQLALCHEMY_DATABASE_URI"] == (
+        "postgresql+psycopg://file-user:file-password@localhost/stockflow?sslmode=require"
+    )
+
+
+@pytest.mark.parametrize("name", ["DATABASE_URL", "SECRET_KEY"])
+def test_production_rejects_unreadable_secret_file(name, tmp_path, monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv(f"{name}_FILE", str(tmp_path / "missing-secret"))
+    other = "SECRET_KEY" if name == "DATABASE_URL" else "DATABASE_URL"
+    monkeypatch.delenv(f"{other}_FILE", raising=False)
+    monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(other, "postgresql://test:test@localhost/stockflow" if other == "DATABASE_URL" else "test-key")
+
+    with pytest.raises(RuntimeError, match=f"{name}_FILE could not be read"):
+        create_app()
+
+
 def test_application_factory_defaults_to_sqlite(monkeypatch):
     monkeypatch.delenv("APP_ENV", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)

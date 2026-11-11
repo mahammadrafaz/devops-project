@@ -1,5 +1,4 @@
-
-name: DevOps CI/CD Pipeline
+name: StockFlow CI/CD Pipeline
 
 on:
   push:
@@ -9,39 +8,40 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  test-and-publish:
+  test:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
-
       - name: Run automated tests
         run: python -m pytest -v
 
+  publish-and-deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
       - name: Log in to Docker Hub
-        if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Build and publish Docker image
-        if: github.event_name == 'push'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -49,134 +49,311 @@ jobs:
           tags: |
             mahammadrafaz/devops-project:latest
             mahammadrafaz/devops-project:sha-${{ github.sha }}
-
-      - name: Debug GitHub OIDC claims
-        if: github.event_name == 'push'
-        run: |
-          python - <<'PY'
-          import os
-          import json
-          import urllib.request
-          import base64
-
-          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
-          token_request_url = url + "&audience=sts.amazonaws.com"
-
-          request = urllib.request.Request(
-              token_request_url,
-              headers={
-                  "Authorization": "Bearer " +
-                  os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
-              }
-          )
-
-          with urllib.request.urlopen(request) as response:
-              token = json.loads(response.read())["value"]
-
-          payload = token.split(".")[1]
-          payload += "=" * (-len(payload) % 4)
-          claims = json.loads(base64.urlsafe_b64decode(payload))
-
-          print("ISS:", claims.get("iss"))
-          print("AUD:", claims.get("aud"))
-          print("SUB:", claims.get("sub"))
-          PY
-
       - name: Configure AWS credentials
-        if: github.event_name == 'push'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::920887851398:role/github-actions-ec2-deploy
           aws-region: eu-north-1
-
       - name: Deploy through AWS Systems Manager
-        if: github.event_name == 'push'
         env:
           EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          SECRET_ID: ${{ vars.STOCKFLOW_SECRET_ID }}
           IMAGE_TAG: sha-${{ github.sha }}
         run: |
           set -euo pipefail
-
-          test -n "$EC2_INSTANCE_ID"
-          test -n "$IMAGE_TAG"
+          : "${EC2_INSTANCE_ID:?Set the EC2_INSTANCE_ID repository variable}"
+          : "${SECRET_ID:?Set the STOCKFLOW_SECRET_ID repository variable}"
 
           DEPLOY_SCRIPT=$(cat <<'SCRIPT'
-          set -e
+          #!/bin/bash
+          set -Eeuo pipefail
 
           IMAGE="mahammadrafaz/devops-project:__IMAGE_TAG__"
+          SECRET_ID=__SECRET_ID__
+          PUBLIC_DOMAIN='rafaz-devops.duckdns.org'
+          SECRET_ROOT='/etc/stockflow/secrets'
+          STATE_DIR='/var/lib/stockflow'
+          STATE_FILE="$STATE_DIR/active"
+          install -d -o root -g root -m 700 "$SECRET_ROOT"
+          install -d -o root -g root -m 700 "$STATE_DIR"
+          DEPLOY_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
+          CANDIDATE_NAME="stockflow-$DEPLOY_ID"
+          SECRET_DIR="$SECRET_ROOT/$DEPLOY_ID"
+          install -d -o root -g root -m 700 "$SECRET_DIR"
+          chown root:root "$SECRET_DIR"
+          chmod 700 "$SECRET_DIR"
+          DATABASE_SECRET="$SECRET_DIR/database_url"
+          APP_SECRET="$SECRET_DIR/secret_key"
+          NGINX_BACKUP=''
+          NGINX_CONFIG=''
+          SWITCH_STARTED=0
+          CANDIDATE_STARTED=0
+          PREVIOUS_NAME=''
+          PREVIOUS_SECRET_DIR=''
+          CANDIDATE_PORT=''
+          PRESERVE_NGINX_BACKUP=0
 
-          echo "Pulling image: $IMAGE"
-          sudo docker pull "$IMAGE"
+          cleanup() {
+            # Keep secret files permanently: Docker needs the bind-mount source
+            # files to exist when it restarts the candidate after an EC2 reboot.
+            # A failed rollback also needs its Nginx backup for manual recovery.
+            if [ -n "$NGINX_BACKUP" ] && [ "$PRESERVE_NGINX_BACKUP" -eq 0 ]; then rm -f "$NGINX_BACKUP"; fi
+          }
 
-          echo "Replacing existing container..."
-          sudo docker rm -f devops-flask || true
-
-          echo "Starting updated container..."
-          sudo docker run -d \
-            --name devops-flask \
-            -p 5000:5000 \
-            --restart unless-stopped \
-            "$IMAGE"
-
-          echo "Checking application health..."
-          for i in $(seq 1 15); do
-            if curl -fsS http://localhost:5000/health; then
-              echo "Deployment successful!"
-              exit 0
+          restore_nginx() {
+            status=$?
+            trap - ERR
+            restoration_succeeded=1
+            if [ "$SWITCH_STARTED" -eq 1 ]; then
+              echo "Traffic switch failed; restoring the backed-up Nginx configuration."
+              if [ -z "$NGINX_CONFIG" ] || [ -z "$NGINX_BACKUP" ] || [ ! -f "$NGINX_BACKUP" ]; then
+                restoration_succeeded=0
+              elif ! cp -p "$NGINX_BACKUP" "$NGINX_CONFIG"; then
+                restoration_succeeded=0
+              elif ! nginx -t; then
+                restoration_succeeded=0
+              elif ! systemctl reload nginx; then
+                restoration_succeeded=0
+              elif ! python3 - "$NGINX_CONFIG" "$ACTIVE_PORT" <<'PY'
+          from pathlib import Path
+          import re, sys
+          text = "\n".join(line.split("#", 1)[0] for line in Path(sys.argv[1]).read_text().splitlines())
+          ports = re.findall(r"\bproxy_pass\s+http://(?:127\.0\.0\.1|localhost):(\d+)\s*;", text)
+          if len(ports) != 1 or ports[0] != sys.argv[2]:
+              raise SystemExit("Restored Nginx proxy target does not match the original active port.")
+          PY
+              then
+                restoration_succeeded=0
+              elif ! curl --silent --fail \
+                  "http://127.0.0.1:${ACTIVE_PORT}/health" >/dev/null 2>&1; then
+                restoration_succeeded=0
+              elif ! curl --silent --fail \
+                  "https://${PUBLIC_DOMAIN}/health" >/dev/null 2>&1; then
+                restoration_succeeded=0
+              fi
+              if [ "$restoration_succeeded" -eq 0 ]; then
+                PRESERVE_NGINX_BACKUP=1
+                echo "EMERGENCY: Rollback verification failed. Candidate container $CANDIDATE_NAME, its secret directory $SECRET_DIR, and Nginx backup $NGINX_BACKUP were preserved. Check the original proxy target (port $ACTIVE_PORT), restore the backup to $NGINX_CONFIG if needed, run 'nginx -t', reload Nginx, then verify the direct and public health endpoints manually. No secret values were printed."
+                exit "$status"
+              fi
+              echo "Nginx configuration restored, validated, and reloaded; original proxy target and direct and public health checks passed."
             fi
-            sleep 2
-          done
+            if [ "$CANDIDATE_STARTED" -eq 1 ]; then
+              docker stop "$CANDIDATE_NAME" >/dev/null 2>&1 || true
+              docker rm "$CANDIDATE_NAME" >/dev/null 2>&1 || true
+              rm -rf -- "$SECRET_DIR"
+            fi
+            exit "$status"
+          }
 
-          echo "Health check failed!"
-          sudo docker logs devops-flask --tail 50
-          exit 1
+          trap cleanup EXIT
+          trap restore_nginx ERR
+
+          echo "Pulling immutable StockFlow image."
+          docker pull "$IMAGE"
+
+          echo "Retrieving production settings from Secrets Manager using the instance role."
+          aws secretsmanager get-secret-value \
+            --secret-id "$SECRET_ID" \
+            --query SecretString \
+            --output text |
+            DATABASE_SECRET="$DATABASE_SECRET" APP_SECRET="$APP_SECRET" python3 -c 'import json,os,sys; s=json.load(sys.stdin); keys=("DATABASE_URL","SECRET_KEY"); missing=[k for k in keys if not isinstance(s.get(k),str) or not s[k] or "\n" in s[k] or "\r" in s[k]]; sys.exit("Required secret missing or invalid") if missing else None; paths=(os.environ["DATABASE_SECRET"],os.environ["APP_SECRET"]); [open(p,"w").write(s[k]) for k,p in zip(keys,paths)]' 2>/dev/null
+          chown 10001:10001 "$DATABASE_SECRET" "$APP_SECRET"
+          chmod 400 "$DATABASE_SECRET" "$APP_SECRET"
+
+          echo "Applying database migrations."
+          if ! docker run --rm \
+            --mount "type=bind,src=$DATABASE_SECRET,dst=/run/secrets/database_url,readonly" \
+            --mount "type=bind,src=$APP_SECRET,dst=/run/secrets/secret_key,readonly" \
+            --env APP_ENV=production \
+            --env DATABASE_URL_FILE=/run/secrets/database_url \
+            --env SECRET_KEY_FILE=/run/secrets/secret_key \
+            "$IMAGE" flask --app app db upgrade >/dev/null 2>&1; then
+            echo "Database migration failed; traffic was not changed. Migration output suppressed to protect credentials."
+            exit 1
+          fi
+
+          echo "Locating the active Nginx proxy configuration."
+          active_config='/etc/nginx/sites-enabled/devops-flask'
+          if [ ! -L "$active_config" ] || [ ! -e "$active_config" ]; then echo "Expected active Nginx symlink is missing or broken: $active_config."; exit 1; fi
+          NGINX_CONFIG="$(readlink -f "$active_config")"
+          if [ ! -f "$NGINX_CONFIG" ]; then echo "Resolved Nginx configuration is not a regular file."; exit 1; fi
+          ACTIVE_PORT="$(python3 - "$NGINX_CONFIG" <<'PY'
+          from pathlib import Path
+          import re, sys
+          text = "\n".join(line.split("#", 1)[0] for line in Path(sys.argv[1]).read_text().splitlines())
+          ports = re.findall(r"\bproxy_pass\s+http://(?:127\.0\.0\.1|localhost):(\d+)\s*;", text)
+          if len(ports) != 1: raise SystemExit(f"Expected exactly one local proxy target; found {len(ports)}.")
+          print(ports[0])
+          PY
+          )"
+          # Nginx is authoritative after a reboot. The state file is a durable
+          # record; reconcile it with the actual upstream before replacing traffic.
+          if [ -f "$STATE_FILE" ]; then
+            IFS=' ' read -r STATE_NAME STATE_PORT < "$STATE_FILE" || true
+          fi
+          if [ "$ACTIVE_PORT" != "5000" ]; then
+            if [ -n "${STATE_NAME:-}" ] && [ "${STATE_PORT:-}" = "$ACTIVE_PORT" ] && docker inspect "$STATE_NAME" >/dev/null 2>&1 && [ "$(docker inspect "$STATE_NAME" --format '{{.State.Running}}')" = "true" ]; then
+              state_port="$(docker port "$STATE_NAME" 5000/tcp 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -n1)"
+              if [ "$state_port" = "$ACTIVE_PORT" ] && [ "$(docker inspect "$STATE_NAME" --format '{{ index .Config.Labels "com.stockflow.managed" }}')" = "true" ]; then PREVIOUS_NAME="$STATE_NAME"; fi
+            fi
+            if [ -n "$PREVIOUS_NAME" ]; then
+              echo "Matched active container from the persistent deployment record."
+            else
+            while read -r name; do
+              [ -n "$name" ] || continue
+              port="$(docker port "$name" 5000/tcp 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -n1)"
+              if [ "$port" = "$ACTIVE_PORT" ]; then PREVIOUS_NAME="$name"; break; fi
+            done < <(docker ps --filter label=com.stockflow.managed=true --format '{{.Names}}')
+            fi
+            if [ -z "$PREVIOUS_NAME" ]; then echo "Nginx points to port $ACTIVE_PORT but no managed StockFlow container owns it; refusing to switch."; exit 1; fi
+            PREVIOUS_SECRET_DIR=''
+          else
+            echo "Nginx still points to the preserved devops-flask demo on port 5000."
+          fi
+
+          echo "Starting unique candidate on an available localhost port."
+          CANDIDATE_STARTED=1
+          docker run -d \
+            --name "$CANDIDATE_NAME" \
+            --label com.stockflow.managed=true \
+            --publish 127.0.0.1::5000 \
+            --restart unless-stopped \
+            --env APP_ENV=production \
+            --env DATABASE_URL_FILE=/run/secrets/database_url \
+            --env SECRET_KEY_FILE=/run/secrets/secret_key \
+            --mount "type=bind,src=$DATABASE_SECRET,dst=/run/secrets/database_url,readonly" \
+            --mount "type=bind,src=$APP_SECRET,dst=/run/secrets/secret_key,readonly" \
+            "$IMAGE" >/dev/null
+          CANDIDATE_PORT="$(docker port "$CANDIDATE_NAME" 5000/tcp | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -n1)"
+          if [ -z "$CANDIDATE_PORT" ]; then echo "Could not determine candidate host port."; exit 1; fi
+
+          check_endpoint() {
+            url="$1"
+            for attempt in $(seq 1 30); do
+              if curl --silent --show-error --fail "$url" >/dev/null 2>&1; then return 0; fi
+              sleep 2
+            done
+            echo "Endpoint check failed: $url"
+            return 1
+          }
+
+          check_endpoint "http://127.0.0.1:$CANDIDATE_PORT/health"
+          check_endpoint "http://127.0.0.1:$CANDIDATE_PORT/ready"
+
+          NGINX_BACKUP="$(mktemp /etc/nginx/stockflow-backup.XXXXXX)"
+          cp -p "$NGINX_CONFIG" "$NGINX_BACKUP"
+
+          SWITCH_STARTED=1
+          python3 - "$NGINX_CONFIG" "$CANDIDATE_PORT" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path = Path(sys.argv[1])
+          lines = path.read_text().splitlines(keepends=True)
+          pattern = re.compile(
+              r"(\bproxy_pass\s+http://(?:127\.0\.0\.1|localhost):)\d+(?=\s*;)"
+          )
+          updated_lines = []
+          count = 0
+          for line in lines:
+              active, marker, comment = line.partition("#")
+              updated, replacements = pattern.subn(r"\g<1>" + sys.argv[2], active)
+              count += replacements
+              updated_lines.append(updated + marker + comment)
+          if count != 1:
+              raise SystemExit("Expected exactly one proxy target to change")
+          path.write_text("".join(updated_lines))
+          PY
+          nginx -t
+          systemctl reload nginx
+
+          echo "Checking the public HTTPS endpoint."
+          check_endpoint "https://${PUBLIC_DOMAIN}/health"
+          check_endpoint "https://${PUBLIC_DOMAIN}/ready"
+          printf '%s %s\n' "$CANDIDATE_NAME" "$CANDIDATE_PORT" > "$STATE_FILE.tmp"
+          chmod 600 "$STATE_FILE.tmp"
+          mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+          SWITCH_STARTED=0
+          CANDIDATE_STARTED=0
+          trap - ERR
+          if [ -n "$PREVIOUS_NAME" ]; then
+            echo "Public checks passed; retiring previous active container $PREVIOUS_NAME."
+            mapfile -t PREVIOUS_SECRET_SOURCES < <(docker inspect "$PREVIOUS_NAME" --format '{{range .Mounts}}{{println .Destination .Source}}{{end}}' | awk '$1 == "/run/secrets/database_url" || $1 == "/run/secrets/secret_key"')
+            PREVIOUS_SECRET_DIR=''
+            if [ "${#PREVIOUS_SECRET_SOURCES[@]}" -eq 2 ]; then
+              for mount in "${PREVIOUS_SECRET_SOURCES[@]}"; do
+                read -r destination source <<< "$mount"
+                case "$destination:$source" in
+                  /run/secrets/database_url:"$SECRET_ROOT"/*/database_url|/run/secrets/secret_key:"$SECRET_ROOT"/*/secret_key) ;;
+                  *) PREVIOUS_SECRET_DIR=''; break ;;
+                esac
+                mount_dir="$(dirname "$source")"
+                if [ -z "$PREVIOUS_SECRET_DIR" ]; then PREVIOUS_SECRET_DIR="$mount_dir"; elif [ "$PREVIOUS_SECRET_DIR" != "$mount_dir" ]; then PREVIOUS_SECRET_DIR=''; break; fi
+              done
+            fi
+            PREVIOUS_CLEANUP_SUCCEEDED=0
+            if docker stop "$PREVIOUS_NAME" >/dev/null && docker rm "$PREVIOUS_NAME" >/dev/null; then
+              PREVIOUS_CLEANUP_SUCCEEDED=1
+            else
+              echo "WARNING: StockFlow deployment succeeded, but cleanup of previous container $PREVIOUS_NAME failed. Manual attention is required; the new candidate remains active and the previous secret directory is preserved."
+            fi
+            if [ "$PREVIOUS_CLEANUP_SUCCEEDED" -eq 1 ]; then
+              if [ -n "$PREVIOUS_SECRET_DIR" ] && [ "$PREVIOUS_SECRET_DIR" != "$SECRET_DIR" ] && [[ "$PREVIOUS_SECRET_DIR" == "$SECRET_ROOT"/* ]]; then
+                rm -rf -- "$PREVIOUS_SECRET_DIR"
+              else
+                echo "Previous container secret mount paths did not pass validation; preserving its secret directory."
+              fi
+            fi
+          fi
+          rm -f "$NGINX_BACKUP"
+          NGINX_BACKUP=''
+          echo "StockFlow deployment and public checks succeeded. The devops-flask demo remains available on port 5000."
           SCRIPT
           )
 
-          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//__IMAGE_TAG__/$IMAGE_TAG}"
-
-          PARAMETERS=$(jq -n --arg script "$DEPLOY_SCRIPT" \
-            '{commands: [$script]}')
-
+          DEPLOY_SCRIPT=$(IMAGE_TAG="$IMAGE_TAG" SECRET_ID="$SECRET_ID" python3 -c 'import os,shlex,sys; s=sys.stdin.read(); print(s.replace("__IMAGE_TAG__",os.environ["IMAGE_TAG"]).replace("__SECRET_ID__",shlex.quote(os.environ["SECRET_ID"])))' <<< "$DEPLOY_SCRIPT")
+          REMOTE_COMMAND=$(DEPLOY_SCRIPT="$DEPLOY_SCRIPT" python3 -c 'import os,shlex; print("bash -c " + shlex.quote(os.environ["DEPLOY_SCRIPT"]))')
+          PARAMETERS=$(jq -n --arg script "$REMOTE_COMMAND" '{commands: [$script]}')
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$EC2_INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploy devops-project from GitHub Actions" \
+            --comment "Deploy StockFlow candidate from GitHub Actions" \
             --parameters "$PARAMETERS" \
             --query "Command.CommandId" \
             --output text)
 
-          echo "SSM command ID: $COMMAND_ID"
-
-          for i in $(seq 1 30); do
+          echo "SSM command submitted: $COMMAND_ID"
+          fetch_invocation_output() {
+            local output
+            output=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query '{stdout:StandardOutputContent,stderr:StandardErrorContent}' \
+              --output json 2>/dev/null || true)
+            if [ -n "$output" ]; then
+              echo "SSM stdout/stderr (deployment script suppresses secret-bearing command output):"
+              jq -r '"stdout:\n" + (.stdout // "") + "\nstderr:\n" + (.stderr // "")' <<< "$output"
+            fi
+          }
+          for attempt in $(seq 1 60); do
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "$EC2_INSTANCE_ID" \
               --query "Status" \
               --output text 2>/dev/null || echo "Pending")
-
-            echo "Deployment status: $STATUS"
-
+            echo "SSM deployment status: $STATUS"
             case "$STATUS" in
-              Success)
-                aws ssm get-command-invocation \
-                  --command-id "$COMMAND_ID" \
-                  --instance-id "$EC2_INSTANCE_ID" \
-                  --query "StandardOutputContent" \
-                  --output text
-                exit 0
-                ;;
-              Failed|Cancelled|TimedOut)
-                aws ssm get-command-invocation \
-                  --command-id "$COMMAND_ID" \
-                  --instance-id "$EC2_INSTANCE_ID" \
-                  --output json
+              Success) echo "SSM deployment completed successfully."; exit 0 ;;
+              Failed|Cancelled|TimedOut|DeliveryTimedOut|ExecutionTimedOut|Cancelling)
+                echo "SSM deployment failed with status: $STATUS"
+                fetch_invocation_output
                 exit 1
                 ;;
             esac
-
             sleep 10
           done
-
-          echo "Deployment timed out while waiting for SSM."
+          echo "SSM deployment did not finish before the polling deadline."
+          fetch_invocation_output
           exit 1

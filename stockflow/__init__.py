@@ -19,7 +19,7 @@ from .extensions import csrf, db, login_manager, migrate
 
 def _database_uri():
     """Return a SQLAlchemy URI for PostgreSQL or the local SQLite fallback."""
-    database_url = os.environ.get("DATABASE_URL")
+    database_url = _configured_secret("DATABASE_URL")
     if not database_url:
         return "sqlite:///stockflow.db"
 
@@ -39,12 +39,27 @@ def _database_uri():
     return url.render_as_string(hide_password=False)
 
 
+def _configured_secret(name):
+    """Read a secret from a protected file, falling back to its env variable."""
+    file_path = os.environ.get(f"{name}_FILE")
+    if file_path:
+        try:
+            with open(file_path, encoding="utf-8") as secret_file:
+                value = secret_file.read().rstrip("\r\n")
+        except OSError:
+            raise RuntimeError(f"{name}_FILE could not be read.") from None
+        if not value:
+            raise RuntimeError(f"{name}_FILE is empty.")
+        return value
+    return os.environ.get(name)
+
+
 def create_app(config=None):
     """Create and configure a StockFlow Flask application instance."""
     app = Flask(__name__)
     app.config.from_mapping(
         APP_ENV=os.environ.get("APP_ENV", "development"),
-        SECRET_KEY=os.environ.get("SECRET_KEY"),
+        SECRET_KEY=_configured_secret("SECRET_KEY"),
         SQLALCHEMY_DATABASE_URI=_database_uri(),
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
         SQLALCHEMY_ECHO=False,
