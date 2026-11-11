@@ -92,11 +92,14 @@ jobs:
           PREVIOUS_SECRET_DIR=''
           CANDIDATE_PORT=''
           PRESERVE_NGINX_BACKUP=0
+          SECRET_DIR_ACTIVE=0
 
           cleanup() {
-            # Keep secret files permanently: Docker needs the bind-mount source
-            # files to exist when it restarts the candidate after an EC2 reboot.
-            # A failed rollback also needs its Nginx backup for manual recovery.
+            # Active candidates need their bind-mount source files across reboots.
+            # Preserve files and the backup if rollback could not be verified.
+            if [ "$SECRET_DIR_ACTIVE" -eq 0 ] && [ "$PRESERVE_NGINX_BACKUP" -eq 0 ] && [ -d "$SECRET_DIR" ]; then
+              rm -rf -- "$SECRET_DIR"
+            fi
             if [ -n "$NGINX_BACKUP" ] && [ "$PRESERVE_NGINX_BACKUP" -eq 0 ]; then rm -f "$NGINX_BACKUP"; fi
           }
 
@@ -153,11 +156,29 @@ jobs:
           docker pull "$IMAGE"
 
           echo "Retrieving production settings from Secrets Manager using the instance role."
-          aws secretsmanager get-secret-value \
-            --secret-id "$SECRET_ID" \
-            --query SecretString \
-            --output text |
-            DATABASE_SECRET="$DATABASE_SECRET" APP_SECRET="$APP_SECRET" python3 -c 'import json,os,sys; s=json.load(sys.stdin); keys=("DATABASE_URL","SECRET_KEY"); missing=[k for k in keys if not isinstance(s.get(k),str) or not s[k] or "\n" in s[k] or "\r" in s[k]]; sys.exit("Required secret missing or invalid") if missing else None; paths=(os.environ["DATABASE_SECRET"],os.environ["APP_SECRET"]); [open(p,"w").write(s[k]) for k,p in zip(keys,paths)]' 2>/dev/null
+          docker run --rm -i --user 0:0 \
+            --env SECRET_ID="$SECRET_ID" \
+            --mount "type=bind,src=$SECRET_DIR,dst=/run/stockflow-secrets" \
+            python:3.12-slim sh -c 'pip install --quiet --disable-pip-version-check boto3 >/dev/null 2>&1 && exec python -' <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import boto3
+
+          try:
+              secret = boto3.client("secretsmanager", region_name="eu-north-1").get_secret_value(
+                  SecretId=os.environ["SECRET_ID"]
+              )["SecretString"]
+              values = json.loads(secret)
+              for key, filename in (("DATABASE_URL", "database_url"), ("SECRET_KEY", "secret_key")):
+                  value = values.get(key)
+                  if not isinstance(value, str) or not value or "\r" in value or "\n" in value:
+                      raise ValueError
+                  (Path("/run/stockflow-secrets") / filename).write_text(value, encoding="utf-8")
+          except Exception:
+              sys.exit("Required production settings could not be retrieved or validated")
+          PY
           chown 10001:10001 "$DATABASE_SECRET" "$APP_SECRET"
           chmod 400 "$DATABASE_SECRET" "$APP_SECRET"
 
@@ -275,6 +296,7 @@ jobs:
           printf '%s %s\n' "$CANDIDATE_NAME" "$CANDIDATE_PORT" > "$STATE_FILE.tmp"
           chmod 600 "$STATE_FILE.tmp"
           mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+          SECRET_DIR_ACTIVE=1
           SWITCH_STARTED=0
           CANDIDATE_STARTED=0
           trap - ERR
