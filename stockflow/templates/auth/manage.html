@@ -1,0 +1,44 @@
+{% extends 'auth/base.html' %}
+{% block title %}Team · StockFlow{% endblock %}
+{% block content %}
+<section class="dashboard">
+  <div class="eyebrow">Business settings</div>
+  <h1>Your team</h1>
+  <p class="muted">Manage people in {{ current_user.business.name }}.</p>
+
+  {% if invitation_link %}
+  <div class="invite-link">
+    <div><strong>Invitation link created</strong><small>Share this link with the invited employee. It expires in {{ config.INVITATION_EXPIRY_HOURS }} hours and can be used once.</small></div>
+    <input id="invite-link" readonly value="{{ invitation_link }}">
+    <button type="button" class="secondary" onclick="navigator.clipboard.writeText(document.getElementById('invite-link').value).then(()=>this.textContent='Copied')">Copy link</button>
+  </div>
+  {% endif %}
+
+  {% if current_user.role == 'owner' %}
+  <div class="panel"><h2>Invite an employee</h2>
+    <form method="post" action="{{ url_for('auth.create_invitation') }}" class="invite-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>Email address<input type="email" name="email" required></label>
+      <label>Role<select name="role"><option value="staff">Staff</option><option value="manager">Manager</option></select></label>
+      <button class="primary">Create invitation</button>
+    </form>
+  </div>
+  {% endif %}
+
+  <div class="panel"><h2>People <span class="count">{{ users|length }}</span></h2>
+    <div class="table-wrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th>{% if current_user.role == 'owner' %}<th>Update role</th>{% endif %}</tr></thead>
+      <tbody>{% for user in users %}<tr><td>{{ user.name }}</td><td>{{ user.email }}</td><td><span class="role">{{ user.role }}</span></td>
+        {% if current_user.role == 'owner' %}<td>{% if user.role != 'owner' %}<form method="post" action="{{ url_for('auth.update_user_role', user_id=user.id) }}" class="inline-form"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><select name="role"><option value="staff" {% if user.role == 'staff' %}selected{% endif %}>Staff</option><option value="manager" {% if user.role == 'manager' %}selected{% endif %}>Manager</option></select><button class="secondary">Save</button></form>{% else %}<span class="muted">Primary owner</span>{% endif %}</td>{% endif %}
+      </tr>{% endfor %}</tbody>
+    </table></div>
+  </div>
+
+  {% if current_user.role == 'owner' %}
+  <div class="panel"><h2>Invitations</h2>
+    {% if invitations %}<div class="table-wrap"><table><thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Expires</th><th></th></tr></thead><tbody>
+      {% for invite in invitations %}<tr><td>{{ invite.email }}</td><td>{{ invite.role }}</td><td>{{ 'Accepted' if invite.used_at else ('Expired' if invitation_expired(invite) else 'Pending') }}</td><td>{{ invite.expires_at.strftime('%b %d, %Y %H:%M UTC') }}</td><td>{% if not invite.used_at and not invitation_expired(invite) %}<form method="post" action="{{ url_for('auth.revoke_invitation', invitation_id=invite.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="link-button">Revoke</button></form>{% endif %}</td></tr>{% endfor %}
+    </tbody></table></div>{% else %}<p class="muted">No invitations yet.</p>{% endif %}
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

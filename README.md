@@ -237,7 +237,7 @@ devops-project/
 
 ├── app.py
 
-├── dockerfile
+├── Dockerfile
 
 ├── requirements.txt
 
@@ -325,11 +325,27 @@ pytest -v
 
 ```bash
 
-docker build -f dockerfile -t devops-project .
+docker build -t devops-project .
 
 ```
 
 
+
+### Initialize or upgrade the database
+
+Database migrations are explicit and are not run automatically when the application starts. Before starting the application against a new or upgraded database, run Alembic's upgrade command using the same database configuration the application will use:
+
+```bash
+docker run --rm --env APP_ENV=production --env DATABASE_URL --env SECRET_KEY devops-project flask --app app db upgrade
+```
+
+Set `DATABASE_URL` to the target database's connection URL. For an already running container, run the command inside that container so it uses its configured database:
+
+```bash
+docker exec devops-flask flask --app app db upgrade
+```
+
+`db upgrade` applies pending revisions without dropping or resetting existing tables or data. The image contains the complete `migrations/` directory, so Flask-Migrate commands are available in the container.
 
 \### Run the container
 
@@ -337,7 +353,7 @@ docker build -f dockerfile -t devops-project .
 
 ```bash
 
-docker run -d -p 5000:5000 --name devops-flask devops-project
+docker run -d -p 5000:5000 --name devops-flask --env APP_ENV=production --env DATABASE_URL --env SECRET_KEY devops-project
 
 ```
 
