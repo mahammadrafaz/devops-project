@@ -57,8 +57,8 @@ def register():
                 db.session.rollback()
                 flash("An account with that email already exists.", "error")
             else:
-                login_user(user)
-                return redirect(url_for("auth.dashboard"))
+                flash("Your workspace has been created successfully. Please sign in.", "success")
+                return redirect(url_for("auth.login"))
     return render_template("auth/register.html")
 
 

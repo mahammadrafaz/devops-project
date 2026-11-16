@@ -154,8 +154,8 @@ def test_health_endpoint():
     assert response.json == {"status": "OK"}
 
 
-def test_home_endpoint_remains_compatible():
+def test_home_redirects_unauthenticated_users_to_login():
     response = default_app.test_client().get("/")
 
-    assert response.status_code == 200
-    assert b"Hello from my DevOps project!" in response.data
+    assert response.status_code == 302
+    assert response.location.endswith("/login")

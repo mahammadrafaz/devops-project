@@ -124,7 +124,7 @@ def create_app(config=None):
     def home():
         if current_user.is_authenticated:
             return redirect(url_for("auth.dashboard"))
-        return "Hello from my DevOps project! - Version 2"
+        return redirect(url_for("auth.login"))
 
     @app.errorhandler(CSRFError)
     def handle_csrf_error(error):
